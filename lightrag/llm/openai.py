@@ -54,6 +54,7 @@ import pipmaster as pm  # Pipmaster for dynamic library install
 if not pm.is_installed("openai"):
     pm.install("openai")
 
+import asyncio
 from openai import (
     AsyncOpenAI,
     APIConnectionError,
@@ -75,7 +76,11 @@ from lightrag.utils import (
 from lightrag.types import GPTKeywordExtractionFormat
 
 import numpy as np
-from typing import Union
+from typing import Union, Optional
+
+class StreamTimeoutBetweenChunks(Exception):
+    """Exception raised when time between stream chunks exceeds maximum allowed time."""
+    pass
 
 
 @retry(
@@ -92,6 +97,7 @@ async def openai_complete_if_cache(
     history_messages=[],
     base_url=None,
     api_key=None,
+    max_chunk_interval: Optional[float] = 10.0,  # Maximum time interval between chunks (seconds)
     **kwargs,
 ) -> str:
     if api_key:
@@ -108,7 +114,6 @@ async def openai_complete_if_cache(
     messages.extend(history_messages)
     messages.append({"role": "user", "content": prompt})
 
-    # 添加日志输出
     logger.debug("===== Query Input to LLM =====")
     logger.debug(f"Query: {prompt}")
     logger.debug(f"System prompt: {system_prompt}")
@@ -123,14 +128,37 @@ async def openai_complete_if_cache(
         )
 
     if hasattr(response, "__aiter__"):
-
         async def inner():
-            async for chunk in response:
+            response_iterator = response.__aiter__()
+            received_first_chunk = False
+            
+            while True:
+                try:
+                    if max_chunk_interval is not None and received_first_chunk:
+                        # Apply timeout only after first chunk
+                        chunk = await asyncio.wait_for(
+                            response_iterator.__anext__(), 
+                            max_chunk_interval
+                        )
+                    else:
+                        chunk = await response_iterator.__anext__()
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    raise StreamTimeoutBetweenChunks(
+                        f"No response received within {max_chunk_interval}s"
+                    )
+                
                 content = chunk.choices[0].delta.content
                 if content is None:
                     continue
+                    
                 if r"\u" in content:
                     content = safe_unicode_decode(content.encode("utf-8"))
+                
+                if not received_first_chunk:
+                    received_first_chunk = True
+                
                 yield content
 
         return inner()
