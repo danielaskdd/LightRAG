@@ -846,6 +846,7 @@ def create_app(args):
             graph_storage=GRAPH_STORAGE,
             vector_storage=VECTOR_STORAGE,
             doc_status_storage=DOC_STATUS_STORAGE,
+            enable_llm_cache=False,
         )
     else:
         rag = LightRAG(
@@ -863,6 +864,7 @@ def create_app(args):
             graph_storage=GRAPH_STORAGE,
             vector_storage=VECTOR_STORAGE,
             doc_status_storage=DOC_STATUS_STORAGE,
+            enable_llm_cache=False,
         )
 
     async def index_file(file_path: Union[str, Path]) -> None:
