@@ -124,34 +124,43 @@ async def openai_complete_if_cache(
                 logger.error("API parse returned None response")
                 raise APIConnectionError(
                     message="API parse returned None response",
-                    request=openai_async_client._client.build_request("POST", base_url or "")
+                    request=openai_async_client._client.build_request(
+                        "POST", base_url or ""
+                    ),
                 )
         except Exception as e:
             logger.error(f"Error calling OpenAI API parse: {str(e)}")
             raise APIConnectionError(
                 message=f"OpenAI API parse error: {str(e)}",
-                request=openai_async_client._client.build_request("POST", base_url or "")
+                request=openai_async_client._client.build_request(
+                    "POST", base_url or ""
+                ),
             )
     else:
         try:
             response = await openai_async_client.chat.completions.create(
                 model=model, messages=messages, **kwargs
             )
-            
+
             if response is None:
                 logger.error("API returned None response")
                 raise APIConnectionError(
                     message="API returned None response",
-                    request=openai_async_client._client.build_request("POST", base_url or "")
+                    request=openai_async_client._client.build_request(
+                        "POST", base_url or ""
+                    ),
                 )
         except Exception as e:
             logger.error(f"Error calling OpenAI API: {str(e)}")
             raise APIConnectionError(
                 message=f"OpenAI API error: {str(e)}",
-                request=openai_async_client._client.build_request("POST", base_url or "")
+                request=openai_async_client._client.build_request(
+                    "POST", base_url or ""
+                ),
             )
 
     if hasattr(response, "__aiter__"):
+
         async def inner():
             try:
                 async for chunk in response:
@@ -166,13 +175,17 @@ async def openai_complete_if_cache(
                         logger.error(f"Error processing stream chunk: {str(e)}")
                         raise APIConnectionError(
                             message=f"Stream chunk processing error: {str(e)}",
-                            request=openai_async_client._client.build_request("POST", base_url or "")
+                            request=openai_async_client._client.build_request(
+                                "POST", base_url or ""
+                            ),
                         )
             except Exception as e:
                 logger.error(f"Error in stream response: {str(e)}")
                 raise APIConnectionError(
                     message=f"Stream response error: {str(e)}",
-                    request=openai_async_client._client.build_request("POST", base_url or "")
+                    request=openai_async_client._client.build_request(
+                        "POST", base_url or ""
+                    ),
                 )
 
         return inner()
