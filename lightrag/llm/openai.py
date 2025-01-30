@@ -73,6 +73,7 @@ from lightrag.utils import (
     logger,
 )
 from lightrag.types import GPTKeywordExtractionFormat
+from lightrag.exceptions import McpError, ErrorCode
 
 import numpy as np
 from typing import Union
@@ -112,26 +113,70 @@ async def openai_complete_if_cache(
     logger.debug("===== Query Input to LLM =====")
     logger.debug(f"Query: {prompt}")
     logger.debug(f"System prompt: {system_prompt}")
-    logger.debug("Full context:")
+    logger.debug(f"Base URL: {base_url}")
+    logger.debug(f"Model: {model}")
+    logger.debug("Messages:")
+    for msg in messages:
+        logger.debug(f"- {msg['role']}: {msg['content']}")
     if "response_format" in kwargs:
-        response = await openai_async_client.beta.chat.completions.parse(
-            model=model, messages=messages, **kwargs
-        )
+        try:
+            response = await openai_async_client.beta.chat.completions.parse(
+                model=model, messages=messages, **kwargs
+            )
+            if response is None:
+                logger.error("API parse returned None response")
+                raise McpError(
+                    ErrorCode.InternalError,
+                    "API parse returned None response"
+                )
+        except Exception as e:
+            logger.error(f"Error calling OpenAI API parse: {str(e)}")
+            raise McpError(
+                ErrorCode.InternalError,
+                f"OpenAI API parse error: {str(e)}"
+            )
     else:
-        response = await openai_async_client.chat.completions.create(
-            model=model, messages=messages, **kwargs
-        )
+        try:
+            response = await openai_async_client.chat.completions.create(
+                model=model, messages=messages, **kwargs
+            )
+            
+            if response is None:
+                logger.error("API returned None response")
+                raise McpError(
+                    ErrorCode.InternalError,
+                    "API returned None response"
+                )
+        except Exception as e:
+            logger.error(f"Error calling OpenAI API: {str(e)}")
+            raise McpError(
+                ErrorCode.InternalError,
+                f"OpenAI API error: {str(e)}"
+            )
 
     if hasattr(response, "__aiter__"):
-
         async def inner():
-            async for chunk in response:
-                content = chunk.choices[0].delta.content
-                if content is None:
-                    continue
-                if r"\u" in content:
-                    content = safe_unicode_decode(content.encode("utf-8"))
-                yield content
+            try:
+                async for chunk in response:
+                    try:
+                        content = chunk.choices[0].delta.content
+                        if content is None:
+                            continue
+                        if r"\u" in content:
+                            content = safe_unicode_decode(content.encode("utf-8"))
+                        yield content
+                    except Exception as e:
+                        logger.error(f"Error processing stream chunk: {str(e)}")
+                        raise McpError(
+                            ErrorCode.InternalError,
+                            f"Stream chunk processing error: {str(e)}"
+                        )
+            except Exception as e:
+                logger.error(f"Error in stream response: {str(e)}")
+                raise McpError(
+                    ErrorCode.InternalError,
+                    f"Stream response error: {str(e)}"
+                )
 
         return inner()
     else:
