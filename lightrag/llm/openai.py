@@ -73,7 +73,7 @@ from lightrag.utils import (
     logger,
 )
 from lightrag.types import GPTKeywordExtractionFormat
-from lightrag.exceptions import McpError, ErrorCode
+from lightrag.exceptions import APIStatusError, APIConnectionError
 
 import numpy as np
 from typing import Union
@@ -125,15 +125,15 @@ async def openai_complete_if_cache(
             )
             if response is None:
                 logger.error("API parse returned None response")
-                raise McpError(
-                    ErrorCode.InternalError,
-                    "API parse returned None response"
+                raise APIConnectionError(
+                    message="API parse returned None response",
+                    request=openai_async_client._client.build_request("POST", base_url or "")
                 )
         except Exception as e:
             logger.error(f"Error calling OpenAI API parse: {str(e)}")
-            raise McpError(
-                ErrorCode.InternalError,
-                f"OpenAI API parse error: {str(e)}"
+            raise APIConnectionError(
+                message=f"OpenAI API parse error: {str(e)}",
+                request=openai_async_client._client.build_request("POST", base_url or "")
             )
     else:
         try:
@@ -143,15 +143,15 @@ async def openai_complete_if_cache(
             
             if response is None:
                 logger.error("API returned None response")
-                raise McpError(
-                    ErrorCode.InternalError,
-                    "API returned None response"
+                raise APIConnectionError(
+                    message="API returned None response",
+                    request=openai_async_client._client.build_request("POST", base_url or "")
                 )
         except Exception as e:
             logger.error(f"Error calling OpenAI API: {str(e)}")
-            raise McpError(
-                ErrorCode.InternalError,
-                f"OpenAI API error: {str(e)}"
+            raise APIConnectionError(
+                message=f"OpenAI API error: {str(e)}",
+                request=openai_async_client._client.build_request("POST", base_url or "")
             )
 
     if hasattr(response, "__aiter__"):
@@ -167,15 +167,15 @@ async def openai_complete_if_cache(
                         yield content
                     except Exception as e:
                         logger.error(f"Error processing stream chunk: {str(e)}")
-                        raise McpError(
-                            ErrorCode.InternalError,
-                            f"Stream chunk processing error: {str(e)}"
+                        raise APIConnectionError(
+                            message=f"Stream chunk processing error: {str(e)}",
+                            request=openai_async_client._client.build_request("POST", base_url or "")
                         )
             except Exception as e:
                 logger.error(f"Error in stream response: {str(e)}")
-                raise McpError(
-                    ErrorCode.InternalError,
-                    f"Stream response error: {str(e)}"
+                raise APIConnectionError(
+                    message=f"Stream response error: {str(e)}",
+                    request=openai_async_client._client.build_request("POST", base_url or "")
                 )
 
         return inner()
