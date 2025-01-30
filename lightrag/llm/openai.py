@@ -54,12 +54,7 @@ import pipmaster as pm  # Pipmaster for dynamic library install
 if not pm.is_installed("openai"):
     pm.install("openai")
 
-from openai import (
-    AsyncOpenAI,
-    APIConnectionError,
-    RateLimitError,
-    APITimeoutError,
-)
+from openai import AsyncOpenAI, APIConnectionError, RateLimitError, APITimeoutError
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -108,11 +103,13 @@ async def openai_complete_if_cache(
     messages.extend(history_messages)
     messages.append({"role": "user", "content": prompt})
 
+    # 添加日志输出
     logger.debug("===== Query Input to LLM =====")
     logger.debug(f"Query: {prompt}")
     logger.debug(f"System prompt: {system_prompt}")
     logger.debug(f"Base URL: {base_url}")
     logger.debug(f"Model: {model}")
+    logger.debug("Messages:")
     for msg in messages:
         logger.debug(f"- {msg['role']}: {msg['content']}")
     if "response_format" in kwargs:
@@ -124,43 +121,32 @@ async def openai_complete_if_cache(
                 logger.error("API parse returned None response")
                 raise APIConnectionError(
                     message="API parse returned None response",
-                    request=openai_async_client._client.build_request(
-                        "POST", base_url or ""
-                    ),
+                    request=openai_async_client._client.build_request("POST", base_url or "")
                 )
+        except APIConnectionError:
+            raise
         except Exception as e:
             logger.error(f"Error calling OpenAI API parse: {str(e)}")
-            raise APIConnectionError(
-                message=f"OpenAI API parse error: {str(e)}",
-                request=openai_async_client._client.build_request(
-                    "POST", base_url or ""
-                ),
-            )
+            raise
     else:
         try:
             response = await openai_async_client.chat.completions.create(
                 model=model, messages=messages, **kwargs
             )
-
+            
             if response is None:
                 logger.error("API returned None response")
                 raise APIConnectionError(
                     message="API returned None response",
-                    request=openai_async_client._client.build_request(
-                        "POST", base_url or ""
-                    ),
+                    request=openai_async_client._client.build_request("POST", base_url or "")
                 )
+        except APIConnectionError:
+            raise
         except Exception as e:
             logger.error(f"Error calling OpenAI API: {str(e)}")
-            raise APIConnectionError(
-                message=f"OpenAI API error: {str(e)}",
-                request=openai_async_client._client.build_request(
-                    "POST", base_url or ""
-                ),
-            )
+            raise
 
     if hasattr(response, "__aiter__"):
-
         async def inner():
             try:
                 async for chunk in response:
@@ -173,20 +159,10 @@ async def openai_complete_if_cache(
                         yield content
                     except Exception as e:
                         logger.error(f"Error processing stream chunk: {str(e)}")
-                        raise APIConnectionError(
-                            message=f"Stream chunk processing error: {str(e)}",
-                            request=openai_async_client._client.build_request(
-                                "POST", base_url or ""
-                            ),
-                        )
+                        raise
             except Exception as e:
                 logger.error(f"Error in stream response: {str(e)}")
-                raise APIConnectionError(
-                    message=f"Stream response error: {str(e)}",
-                    request=openai_async_client._client.build_request(
-                        "POST", base_url or ""
-                    ),
-                )
+                raise
 
         return inner()
     else:
