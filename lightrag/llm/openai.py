@@ -73,7 +73,6 @@ from lightrag.utils import (
     logger,
 )
 from lightrag.types import GPTKeywordExtractionFormat
-from lightrag.exceptions import APIStatusError, APIConnectionError
 
 import numpy as np
 from typing import Union
@@ -109,13 +108,11 @@ async def openai_complete_if_cache(
     messages.extend(history_messages)
     messages.append({"role": "user", "content": prompt})
 
-    # 添加日志输出
     logger.debug("===== Query Input to LLM =====")
     logger.debug(f"Query: {prompt}")
     logger.debug(f"System prompt: {system_prompt}")
     logger.debug(f"Base URL: {base_url}")
     logger.debug(f"Model: {model}")
-    logger.debug("Messages:")
     for msg in messages:
         logger.debug(f"- {msg['role']}: {msg['content']}")
     if "response_format" in kwargs:
