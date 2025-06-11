@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from typing import List, Dict, Any, Optional
 import logging
 import time
@@ -30,6 +30,21 @@ class OllamaMessage(BaseModel):
     role: str
     content: str
     images: Optional[List[str]] = None
+    
+    @model_validator(mode='before')
+    @classmethod
+    def parse_message_body(cls, data):
+        """Process message body that might be a JSON string"""
+        if isinstance(data, str):
+            try:
+                parsed = json.loads(data)
+                if not isinstance(parsed, dict):
+                    raise ValueError("Message body must be a JSON object")
+                return parsed
+            except json.JSONDecodeError:
+                # If parsing fails, keep the original string
+                return data
+        return data
 
 
 class OllamaChatRequest(BaseModel):
@@ -38,6 +53,22 @@ class OllamaChatRequest(BaseModel):
     stream: bool = True
     options: Optional[Dict[str, Any]] = None
     system: Optional[str] = None
+    
+    @model_validator(mode='before')
+    @classmethod
+    def parse_request_body(cls, data):
+        """Process request body that might be a JSON string"""
+        if isinstance(data, str):
+            try:
+                parsed = json.loads(data)
+                if not isinstance(parsed, dict):
+                    raise ValueError("Request body must be a JSON object")
+                logging.debug("Successfully parsed JSON string request body")
+                return parsed
+            except json.JSONDecodeError as e:
+                logging.error(f"Failed to parse JSON request body: {str(e)}")
+                raise ValueError(f"Invalid JSON format in request body: {str(e)}")
+        return data
 
 
 class OllamaChatResponse(BaseModel):
@@ -53,6 +84,22 @@ class OllamaGenerateRequest(BaseModel):
     system: Optional[str] = None
     stream: bool = False
     options: Optional[Dict[str, Any]] = None
+    
+    @model_validator(mode='before')
+    @classmethod
+    def parse_request_body(cls, data):
+        """Process request body that might be a JSON string"""
+        if isinstance(data, str):
+            try:
+                parsed = json.loads(data)
+                if not isinstance(parsed, dict):
+                    raise ValueError("Request body must be a JSON object")
+                logging.debug("Successfully parsed JSON string request body")
+                return parsed
+            except json.JSONDecodeError as e:
+                logging.error(f"Failed to parse JSON request body: {str(e)}")
+                raise ValueError(f"Invalid JSON format in request body: {str(e)}")
+        return data
 
 
 class OllamaGenerateResponse(BaseModel):
@@ -99,6 +146,20 @@ def estimate_tokens(text: str) -> int:
     """Estimate the number of tokens in text using tiktoken"""
     tokens = TiktokenTokenizer().encode(text)
     return len(tokens)
+
+
+def log_request_body(request_body, prefix=""):
+    """Log request body for debugging purposes"""
+    if isinstance(request_body, str):
+        # Truncate long strings to avoid oversized logs
+        log_str = request_body[:500] + "..." if len(request_body) > 500 else request_body
+        logging.debug(f"{prefix}String request body: {log_str}")
+    elif isinstance(request_body, dict):
+        # For dictionaries, log keys and their value types
+        keys_info = {k: type(v).__name__ for k, v in request_body.items()}
+        logging.debug(f"{prefix}Dict request body keys: {keys_info}")
+    else:
+        logging.debug(f"{prefix}Request body type: {type(request_body)}")
 
 
 def parse_query_mode(query: str) -> tuple[str, SearchMode, bool, Optional[str]]:
@@ -204,6 +265,8 @@ class OllamaAPI:
             and will be handled by underlying LLM model.
             """
             try:
+                # Log request body information for debugging
+                log_request_body(request, prefix="Generate API: ")
                 query = request.prompt
                 start_time = time.time_ns()
                 prompt_tokens = estimate_tokens(query)
@@ -370,6 +433,8 @@ class OllamaAPI:
             Detects and forwards OpenWebUI session-related requests (for meta data generation task) directly to LLM.
             """
             try:
+                # Log request body information for debugging
+                log_request_body(request, prefix="Chat API: ")
                 # Get all messages
                 messages = request.messages
                 if not messages:
