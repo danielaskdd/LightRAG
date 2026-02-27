@@ -4,16 +4,16 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "bunx --bun vite",
-    "build": "bunx --bun vite build",
+    "dev": "vite",
+    "build": "vite build",
     "lint": "eslint .",
-    "preview": "bunx --bun vite preview",
+    "preview": "vite preview",
     "test": "bun test",
     "test:watch": "bun test --watch",
     "test:coverage": "bun test --coverage",
-    "dev-no-bun": "vite",
-    "build-no-bun": "vite build --emptyOutDir",
-    "preview-no-bun": "vite preview"
+    "dev:bun": "bunx --bun vite",
+    "build:bun": "bunx --bun vite build",
+    "preview:bun": "bunx --bun vite preview"
   },
   "dependencies": {
     "@faker-js/faker": "^10.3.0",
