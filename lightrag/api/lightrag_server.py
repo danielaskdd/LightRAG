@@ -779,7 +779,11 @@ def create_app(args):
                         else azure_openai_embed
                     )
                     # Pass model only if provided, let function use its default otherwise
-                    kwargs = {"texts": texts, "api_key": api_key}
+                    kwargs = {
+                        "texts": texts,
+                        "api_key": api_key,
+                        "embedding_dim": embedding_dim,
+                    }
                     if model:
                         kwargs["model"] = model
                     return await actual_func(**kwargs)
