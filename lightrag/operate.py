@@ -1630,7 +1630,11 @@ async def _merge_nodes_then_upsert(
     # 1. Get existing node data from knowledge graph
     already_node = await knowledge_graph_inst.get_node(entity_name)
     if already_node:
-        existing_entity_type = already_node.get("entity_type") or "UNKNOWN"
+        existing_entity_type = already_node.get("entity_type")
+        # Coerce to str before any string operations: non-string values from
+        # API/custom graph paths would otherwise raise TypeError on the comma check.
+        if not isinstance(existing_entity_type, str) or not existing_entity_type.strip():
+            existing_entity_type = "UNKNOWN"
         # Sanitize entity_type read back from DB to prevent dirty data from propagating
         if "," in existing_entity_type:
             original = existing_entity_type
