@@ -6,7 +6,6 @@ import asyncio
 from functools import lru_cache
 from lightrag.utils import logger, get_pinyin_sort_key
 import aiofiles
-import shutil
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +23,11 @@ from pydantic import BaseModel, Field, field_validator
 
 from lightrag import LightRAG
 from lightrag.base import DeletionResult, DocProcessingStatus, DocStatus
-from lightrag.utils import generate_track_id
+from lightrag.utils import (
+    generate_track_id,
+    compute_mdhash_id,
+    sanitize_text_for_encoding,
+)
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
 
@@ -159,7 +162,7 @@ class ReprocessResponse(BaseModel):
     Attributes:
         status: Status of the reprocessing operation
         message: Message describing the operation result
-        track_id: Tracking ID for monitoring reprocessing progress
+        track_id: Always empty string. Reprocessed documents retain their original track_id.
     """
 
     status: Literal["reprocessing_started"] = Field(
@@ -167,7 +170,8 @@ class ReprocessResponse(BaseModel):
     )
     message: str = Field(description="Human-readable message describing the operation")
     track_id: str = Field(
-        description="Tracking ID for monitoring reprocessing progress"
+        default="",
+        description="Always empty string. Reprocessed documents retain their original track_id from initial upload.",
     )
 
     class Config:
@@ -175,7 +179,7 @@ class ReprocessResponse(BaseModel):
             "example": {
                 "status": "reprocessing_started",
                 "message": "Reprocessing of failed documents has been initiated in background",
-                "track_id": "retry_20250729_170612_def456",
+                "track_id": "",
             }
         }
 
@@ -764,6 +768,7 @@ class DocumentManager:
         supported_extensions: tuple = (
             ".txt",
             ".md",
+            ".mdx",  # MDX (Markdown + JSX)
             ".pdf",
             ".docx",
             ".pptx",
@@ -787,7 +792,9 @@ class DocumentManager:
             ".bat",  # Batch files
             ".sh",  # Shell scripts
             ".c",  # C source code
+            ".h",  # C header
             ".cpp",  # C++ source code
+            ".hpp",  # C++ header
             ".py",  # Python source code
             ".java",  # Java source code
             ".js",  # JavaScript source code
@@ -1010,10 +1017,10 @@ def _extract_docx(file_bytes: bytes) -> str:
         # CRITICAL: Escape backslash first to avoid double-escaping
         return (
             text.replace("\\", "\\\\")  # Must be first: \ -> \\
-            .replace("\t", "\\t")  # Tab -> \t (visible)
-            .replace("\r\n", "\\n")  # Windows newline -> \n
-            .replace("\r", "\\n")  # Mac newline -> \n
-            .replace("\n", "\\n")  # Unix newline -> \n
+            .replace("\t", "&emsp;&emsp;")  # Tab -> \t (visible)
+            .replace("\r\n", "<br>")  # Windows newline -> \n
+            .replace("\r", "<br>")  # Mac newline -> \n
+            .replace("\n", "<br>")  # Unix newline -> \n
         )
 
     content_parts = []
@@ -1263,6 +1270,7 @@ async def pipeline_enqueue_file(
                 case (
                     ".txt"
                     | ".md"
+                    | ".mdx"
                     | ".html"
                     | ".htm"
                     | ".tex"
@@ -1282,7 +1290,9 @@ async def pipeline_enqueue_file(
                     | ".bat"
                     | ".sh"
                     | ".c"
+                    | ".h"
                     | ".cpp"
+                    | ".hpp"
                     | ".py"
                     | ".java"
                     | ".js"
@@ -2073,16 +2083,49 @@ def create_document_routes(
         uploaded file is of a supported type, saves it in the specified input directory,
         indexes it for retrieval, and returns a success status with relevant details.
 
+        **File Size Limit:**
+        - Configurable via `MAX_UPLOAD_SIZE` environment variable (default: 100MB)
+        - Set to `None` or `0` for unlimited upload size
+        - Returns HTTP 413 (Request Entity Too Large) if file exceeds limit
+
+        **Duplicate Detection Behavior:**
+
+        This endpoint handles two types of duplicate scenarios differently:
+
+        1. **Filename Duplicate (Synchronous Detection)**:
+           - Detected immediately before file processing
+           - Returns `status="duplicated"` with the existing document's track_id
+           - Two cases:
+             - If filename exists in document storage: returns existing track_id
+             - If filename exists in file system only: returns empty track_id ("")
+
+        2. **Content Duplicate (Asynchronous Detection)**:
+           - Detected during background processing after content extraction
+           - Returns `status="success"` with a new track_id immediately
+           - The duplicate is detected later when processing the file content
+           - Use `/documents/track_status/{track_id}` to check the final result:
+             - Document will have `status="FAILED"`
+             - `error_msg` contains "Content already exists. Original doc_id: xxx"
+             - `metadata.is_duplicate=true` with reference to original document
+             - `metadata.original_doc_id` points to the existing document
+             - `metadata.original_track_id` shows the original upload's track_id
+
+        **Why Different Behavior?**
+        - Filename check is fast (simple lookup), done synchronously
+        - Content extraction is expensive (PDF/DOCX parsing), done asynchronously
+        - This design prevents blocking the client during expensive operations
+
         Args:
             background_tasks: FastAPI BackgroundTasks for async processing
             file (UploadFile): The file to be uploaded. It must have an allowed extension.
 
         Returns:
             InsertResponse: A response object containing the upload status and a message.
-                status can be "success", "duplicated", or error is thrown.
+                - status="success": File accepted and queued for processing
+                - status="duplicated": Filename already exists (see track_id for existing document)
 
         Raises:
-            HTTPException: If the file type is not supported (400) or other errors occur (500).
+            HTTPException: If the file type is not supported (400), file too large (413), or other errors occur (500).
         """
         try:
             # Sanitize filename to prevent Path Traversal attacks
@@ -2094,15 +2137,38 @@ def create_document_routes(
                     detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
                 )
 
+            # Check file size limit (if configured)
+            if (
+                global_args.max_upload_size is not None
+                and global_args.max_upload_size > 0
+            ):
+                # Safe access to file size (not available in older Starlette versions)
+                file_size = getattr(file, "size", None)
+
+                # Pre-flight size check (only if size is available)
+                if file_size is not None:
+                    if file_size > global_args.max_upload_size:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"File too large. Maximum size: {global_args.max_upload_size / 1024 / 1024:.1f}MB, uploaded: {file_size / 1024 / 1024:.1f}MB",
+                        )
+                else:
+                    # If size not available, we'll check during streaming
+                    logger.debug(
+                        f"File size not available in UploadFile for {safe_filename}, will check during streaming"
+                    )
+
             # Check if filename already exists in doc_status storage
             existing_doc_data = await rag.doc_status.get_doc_by_file_path(safe_filename)
             if existing_doc_data:
-                # Get document status information for error message
+                # Get document status and track_id from existing document
                 status = existing_doc_data.get("status", "unknown")
+                # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
+                existing_track_id = existing_doc_data.get("track_id") or ""
                 return InsertResponse(
                     status="duplicated",
                     message=f"File '{safe_filename}' already exists in document storage (Status: {status}).",
-                    track_id="",
+                    track_id=existing_track_id,
                 )
 
             file_path = doc_manager.input_dir / safe_filename
@@ -2114,8 +2180,44 @@ def create_document_routes(
                     track_id="",
                 )
 
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+            # Async streaming write with size check
+            bytes_written = 0
+            chunk_size = 1024 * 1024  # 1MB chunks
+            needs_cleanup = False
+
+            async with aiofiles.open(file_path, "wb") as out_file:
+                while True:
+                    # Read chunk from upload stream
+                    chunk = await file.read(chunk_size)
+                    if not chunk:
+                        break
+
+                    # Check size limit during streaming (if not checked before)
+                    if (
+                        global_args.max_upload_size is not None
+                        and global_args.max_upload_size > 0
+                    ):
+                        bytes_written += len(chunk)
+                        if bytes_written > global_args.max_upload_size:
+                            needs_cleanup = True
+                            break
+
+                    # Write chunk to file
+                    await out_file.write(chunk)
+
+            # Cleanup after file is closed
+            if needs_cleanup:
+                try:
+                    file_path.unlink()
+                except Exception as cleanup_error:
+                    logger.error(
+                        f"Error cleaning up oversized file {safe_filename}: {cleanup_error}"
+                    )
+
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large. Maximum size: {global_args.max_upload_size / 1024 / 1024:.1f}MB, uploaded: {bytes_written / 1024 / 1024:.1f}MB",
+                )
 
             track_id = generate_track_id("upload")
 
@@ -2128,6 +2230,9 @@ def create_document_routes(
                 track_id=track_id,
             )
 
+        except HTTPException:
+            # Re-raise HTTP exceptions (400, 413, etc.)
+            raise
         except Exception as e:
             logger.error(f"Error /documents/upload: {file.filename}: {str(e)}")
             logger.error(traceback.format_exc())
@@ -2166,13 +2271,29 @@ def create_document_routes(
                     request.file_source
                 )
                 if existing_doc_data:
-                    # Get document status information for error message
+                    # Get document status and track_id from existing document
                     status = existing_doc_data.get("status", "unknown")
+                    # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
+                    existing_track_id = existing_doc_data.get("track_id") or ""
                     return InsertResponse(
                         status="duplicated",
                         message=f"File source '{request.file_source}' already exists in document storage (Status: {status}).",
-                        track_id="",
+                        track_id=existing_track_id,
                     )
+
+            # Check if content already exists by computing content hash (doc_id)
+            sanitized_text = sanitize_text_for_encoding(request.text)
+            content_doc_id = compute_mdhash_id(sanitized_text, prefix="doc-")
+            existing_doc = await rag.doc_status.get_by_id(content_doc_id)
+            if existing_doc:
+                # Content already exists, return duplicated with existing track_id
+                status = existing_doc.get("status", "unknown")
+                existing_track_id = existing_doc.get("track_id") or ""
+                return InsertResponse(
+                    status="duplicated",
+                    message=f"Identical content already exists in document storage (doc_id: {content_doc_id}, Status: {status}).",
+                    track_id=existing_track_id,
+                )
 
             # Generate track_id for text insertion
             track_id = generate_track_id("insert")
@@ -2232,13 +2353,30 @@ def create_document_routes(
                             file_source
                         )
                         if existing_doc_data:
-                            # Get document status information for error message
+                            # Get document status and track_id from existing document
                             status = existing_doc_data.get("status", "unknown")
+                            # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
+                            existing_track_id = existing_doc_data.get("track_id") or ""
                             return InsertResponse(
                                 status="duplicated",
                                 message=f"File source '{file_source}' already exists in document storage (Status: {status}).",
-                                track_id="",
+                                track_id=existing_track_id,
                             )
+
+            # Check if any content already exists by computing content hash (doc_id)
+            for text in request.texts:
+                sanitized_text = sanitize_text_for_encoding(text)
+                content_doc_id = compute_mdhash_id(sanitized_text, prefix="doc-")
+                existing_doc = await rag.doc_status.get_by_id(content_doc_id)
+                if existing_doc:
+                    # Content already exists, return duplicated with existing track_id
+                    status = existing_doc.get("status", "unknown")
+                    existing_track_id = existing_doc.get("track_id") or ""
+                    return InsertResponse(
+                        status="duplicated",
+                        message=f"Identical content already exists in document storage (doc_id: {content_doc_id}, Status: {status}).",
+                        track_id=existing_track_id,
+                    )
 
             # Generate track_id for texts insertion
             track_id = generate_track_id("insert")
@@ -3058,29 +3196,27 @@ def create_document_routes(
         This is useful for recovering from server crashes, network errors, LLM service
         outages, or other temporary failures that caused document processing to fail.
 
-        The processing happens in the background and can be monitored using the
-        returned track_id or by checking the pipeline status.
+        The processing happens in the background and can be monitored by checking the
+        pipeline status. The reprocessed documents retain their original track_id from
+        initial upload, so use their original track_id to monitor progress.
 
         Returns:
-            ReprocessResponse: Response with status, message, and track_id
+            ReprocessResponse: Response with status and message.
+                track_id is always empty string because reprocessed documents retain
+                their original track_id from initial upload.
 
         Raises:
             HTTPException: If an error occurs while initiating reprocessing (500).
         """
         try:
-            # Generate track_id with "retry" prefix for retry operation
-            track_id = generate_track_id("retry")
-
             # Start the reprocessing in the background
+            # Note: Reprocessed documents retain their original track_id from initial upload
             background_tasks.add_task(rag.apipeline_process_enqueue_documents)
-            logger.info(
-                f"Reprocessing of failed documents initiated with track_id: {track_id}"
-            )
+            logger.info("Reprocessing of failed documents initiated")
 
             return ReprocessResponse(
                 status="reprocessing_started",
-                message="Reprocessing of failed documents has been initiated in background",
-                track_id=track_id,
+                message="Reprocessing of failed documents has been initiated in background. Documents retain their original track_id.",
             )
 
         except Exception as e:

@@ -44,12 +44,30 @@ config.read("config.ini", "utf-8")
 logging.getLogger("neo4j").setLevel(logging.ERROR)
 
 
+READ_RETRY_EXCEPTIONS = (
+    neo4jExceptions.ServiceUnavailable,
+    neo4jExceptions.TransientError,
+    neo4jExceptions.SessionExpired,
+    ConnectionResetError,
+    OSError,
+    AttributeError,
+)
+
+READ_RETRY = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type(READ_RETRY_EXCEPTIONS),
+    reraise=True,
+)
+
+
 @final
 @dataclass
 class Neo4JStorage(BaseGraphStorage):
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
         # Read env and override the arg if present
         neo4j_workspace = os.environ.get("NEO4J_WORKSPACE")
+        original_workspace = workspace  # Save original value for logging
         if neo4j_workspace and neo4j_workspace.strip():
             workspace = neo4j_workspace
 
@@ -63,16 +81,46 @@ class Neo4JStorage(BaseGraphStorage):
             global_config=global_config,
             embedding_func=embedding_func,
         )
+
+        # Log after super().__init__() to ensure self.workspace is initialized
+        if neo4j_workspace and neo4j_workspace.strip():
+            logger.info(
+                f"Using NEO4J_WORKSPACE environment variable: '{neo4j_workspace}' (overriding '{original_workspace}/{namespace}')"
+            )
+
         self._driver = None
 
     def _get_workspace_label(self) -> str:
         """Return workspace label (guaranteed non-empty during initialization)"""
         return self.workspace
 
+    def _normalize_index_suffix(self, workspace_label: str) -> str:
+        """Normalize workspace label for safe use in index names."""
+        normalized = re.sub(r"[^A-Za-z0-9_]+", "_", workspace_label).strip("_")
+        if not normalized:
+            normalized = "base"
+        if not re.match(r"[A-Za-z_]", normalized[0]):
+            normalized = f"ws_{normalized}"
+        return normalized
+
+    def _get_fulltext_index_name(self, workspace_label: str) -> str:
+        """Return a full-text index name derived from the normalized workspace label."""
+        suffix = self._normalize_index_suffix(workspace_label)
+        return f"entity_id_fulltext_idx_{suffix}"
+
     def _is_chinese_text(self, text: str) -> bool:
-        """Check if text contains Chinese characters."""
-        chinese_pattern = re.compile(r"[\u4e00-\u9fff]+")
-        return bool(chinese_pattern.search(text))
+        """Check if text contains Chinese/CJK characters.
+
+        Covers:
+        - CJK Unified Ideographs (U+4E00-U+9FFF)
+        - CJK Extension A (U+3400-U+4DBF)
+        - CJK Compatibility Ideographs (U+F900-U+FAFF)
+        - CJK Extension B-F (U+20000-U+2FA1F) - supplementary planes
+        """
+        cjk_pattern = re.compile(
+            r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[\U00020000-\U0002fa1f]"
+        )
+        return bool(cjk_pattern.search(text))
 
     async def initialize(self):
         async with get_data_init_lock():
@@ -230,7 +278,8 @@ class Neo4JStorage(BaseGraphStorage):
         self, driver: AsyncDriver, database: str, workspace_label: str
     ):
         """Create a full-text index on the entity_id property with Chinese tokenizer support."""
-        index_name = "entity_id_fulltext_idx"
+        index_name = self._get_fulltext_index_name(workspace_label)
+        legacy_index_name = "entity_id_fulltext_idx"
         try:
             async with driver.session(database=database) as session:
                 # Check if the full-text index exists and get its configuration
@@ -240,10 +289,33 @@ class Neo4JStorage(BaseGraphStorage):
                 await result.consume()
 
                 existing_index = None
+                legacy_index = None
                 for idx in indexes:
                     if idx["name"] == index_name:
                         existing_index = idx
+                    elif idx["name"] == legacy_index_name:
+                        legacy_index = idx
+                    # Break early if we found both indexes
+                    if existing_index and legacy_index:
                         break
+
+                # Handle legacy index migration
+                if legacy_index and not existing_index:
+                    logger.info(
+                        f"[{self.workspace}] Found legacy index '{legacy_index_name}'. Migrating to '{index_name}'."
+                    )
+                    try:
+                        # Drop the legacy index (use IF EXISTS for safety)
+                        drop_query = f"DROP INDEX {legacy_index_name} IF EXISTS"
+                        result = await session.run(drop_query)
+                        await result.consume()
+                        logger.info(
+                            f"[{self.workspace}] Dropped legacy index '{legacy_index_name}'"
+                        )
+                    except Exception as drop_error:
+                        logger.warning(
+                            f"[{self.workspace}] Failed to drop legacy index: {str(drop_error)}"
+                        )
 
                 # Check if index exists and is online
                 if existing_index:
@@ -274,10 +346,10 @@ class Neo4JStorage(BaseGraphStorage):
                 needs_creation = existing_index is None
 
                 if needs_recreation or needs_creation:
-                    # Drop existing index if it needs recreation
+                    # Drop existing index if it needs recreation (use IF EXISTS for safety)
                     if needs_recreation:
                         try:
-                            drop_query = f"DROP INDEX {index_name}"
+                            drop_query = f"DROP INDEX {index_name} IF EXISTS"
                             result = await session.run(drop_query)
                             await result.consume()
                             logger.info(
@@ -352,6 +424,7 @@ class Neo4JStorage(BaseGraphStorage):
         # Neo4J handles persistence automatically
         pass
 
+    @READ_RETRY
     async def has_node(self, node_id: str) -> bool:
         """
         Check if a node with the given label exists in the database
@@ -385,6 +458,7 @@ class Neo4JStorage(BaseGraphStorage):
                     await result.consume()  # Ensure results are consumed even on error
                 raise
 
+    @READ_RETRY
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
         """
         Check if an edge exists between two nodes
@@ -426,6 +500,7 @@ class Neo4JStorage(BaseGraphStorage):
                     await result.consume()  # Ensure results are consumed even on error
                 raise
 
+    @READ_RETRY
     async def get_node(self, node_id: str) -> dict[str, str] | None:
         """Get node by its label identifier, return only node properties
 
@@ -479,6 +554,7 @@ class Neo4JStorage(BaseGraphStorage):
                 )
                 raise
 
+    @READ_RETRY
     async def get_nodes_batch(self, node_ids: list[str]) -> dict[str, dict]:
         """
         Retrieve multiple nodes in one query using UNWIND.
@@ -515,6 +591,7 @@ class Neo4JStorage(BaseGraphStorage):
             await result.consume()  # Make sure to consume the result fully
             return nodes
 
+    @READ_RETRY
     async def node_degree(self, node_id: str) -> int:
         """Get the degree (number of relationships) of a node with the given label.
         If multiple nodes have the same label, returns the degree of the first node.
@@ -563,6 +640,7 @@ class Neo4JStorage(BaseGraphStorage):
                 )
                 raise
 
+    @READ_RETRY
     async def node_degrees_batch(self, node_ids: list[str]) -> dict[str, int]:
         """
         Retrieve the degree for multiple nodes in a single query using UNWIND.
@@ -621,6 +699,7 @@ class Neo4JStorage(BaseGraphStorage):
         degrees = int(src_degree) + int(trg_degree)
         return degrees
 
+    @READ_RETRY
     async def edge_degrees_batch(
         self, edge_pairs: list[tuple[str, str]]
     ) -> dict[tuple[str, str], int]:
@@ -647,6 +726,7 @@ class Neo4JStorage(BaseGraphStorage):
             edge_degrees[(src, tgt)] = degrees.get(src, 0) + degrees.get(tgt, 0)
         return edge_degrees
 
+    @READ_RETRY
     async def get_edge(
         self, source_node_id: str, target_node_id: str
     ) -> dict[str, str] | None:
@@ -734,6 +814,7 @@ class Neo4JStorage(BaseGraphStorage):
             )
             raise
 
+    @READ_RETRY
     async def get_edges_batch(
         self, pairs: list[dict[str, str]]
     ) -> dict[tuple[str, str], dict]:
@@ -784,6 +865,7 @@ class Neo4JStorage(BaseGraphStorage):
             await result.consume()
             return edges_dict
 
+    @READ_RETRY
     async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
         """Retrieves all edges (relationships) for a particular node identified by its label.
 
@@ -851,6 +933,7 @@ class Neo4JStorage(BaseGraphStorage):
             )
             raise
 
+    @READ_RETRY
     async def get_nodes_edges_batch(
         self, node_ids: list[str]
     ) -> dict[str, list[tuple[str, str]]]:
@@ -938,6 +1021,27 @@ class Neo4JStorage(BaseGraphStorage):
         entity_type = properties["entity_type"]
         if "entity_id" not in properties:
             raise ValueError("Neo4j: node properties must contain an 'entity_id' field")
+
+        # Coerce to str first so membership checks below never raise TypeError
+        # regardless of what upstream callers (e.g. API payloads) pass in.
+        entity_type = (
+            str(entity_type) if not isinstance(entity_type, str) else entity_type
+        )
+
+        # Sanitize entity_type: strip backticks and handle comma-separated values.
+        # This guards against dirty data from LLM extraction or database read-back.
+        if "`" in entity_type or "," in entity_type or not entity_type.strip():
+            original = entity_type
+            entity_type = entity_type.replace("`", "").strip()
+            if "," in entity_type:
+                entity_type = entity_type.split(",")[0].strip()
+            if not entity_type:
+                entity_type = "UNKNOWN"
+            logger.warning(
+                f"[{self.workspace}] Entity type sanitized in upsert_node: '{original}' -> '{entity_type}'"
+            )
+            properties = dict(properties)
+            properties["entity_type"] = entity_type
 
         try:
             async with self._driver.session(database=self._DATABASE) as session:
@@ -1401,7 +1505,7 @@ class Neo4JStorage(BaseGraphStorage):
 
     async def get_all_labels(self) -> list[str]:
         """
-        Get all existing node labels in the database
+        Get all existing entity_ids(entity names) in the database
         Returns:
             ["Person", "Company", ...]  # Alphabetically sorted label list
         """
@@ -1587,13 +1691,13 @@ class Neo4JStorage(BaseGraphStorage):
             return edges
 
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
-        """Get popular labels by node degree (most connected entities)
+        """Get popular labels(entity names) by node degree (most connected entities)
 
         Args:
             limit: Maximum number of labels to return
 
         Returns:
-            List of labels sorted by degree (highest first)
+            List of labels(entity names) sorted by degree (highest first)
         """
         workspace_label = self._get_workspace_label()
         async with self._driver.session(
@@ -1630,7 +1734,7 @@ class Neo4JStorage(BaseGraphStorage):
 
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
         """
-        Search labels with fuzzy matching, using a full-text index for performance if available.
+        Search labels(entity names) with fuzzy matching, using a full-text index for performance if available.
         Enhanced with Chinese text support using CJK analyzer.
         Falls back to a slower CONTAINS search if the index is not available or fails.
         """
@@ -1641,7 +1745,7 @@ class Neo4JStorage(BaseGraphStorage):
 
         query_lower = query_strip.lower()
         is_chinese = self._is_chinese_text(query_strip)
-        index_name = "entity_id_fulltext_idx"
+        index_name = self._get_fulltext_index_name(workspace_label)
 
         # Attempt to use the full-text index first
         try:

@@ -7,7 +7,7 @@ import inspect
 import os
 import time
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
 from typing import (
@@ -41,6 +41,7 @@ from lightrag.constants import (
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_CONTEXT_SIZE,
     DEFAULT_SUMMARY_LENGTH_RECOMMENDED,
+    DEFAULT_MAX_EXTRACT_INPUT_TOKENS,
     DEFAULT_MAX_ASYNC,
     DEFAULT_MAX_PARALLEL_INSERT,
     DEFAULT_MAX_GRAPH_NODES,
@@ -125,6 +126,28 @@ config = configparser.ConfigParser()
 config.read("config.ini", "utf-8")
 
 
+def _chunk_fields_from_status_doc(
+    status_doc: "DocProcessingStatus",
+) -> tuple[list[str], int]:
+    """Return (chunks_list, chunks_count) preserved from a status document.
+
+    Filters out any non-string or empty chunk IDs.  When chunks_count is
+    absent or invalid, it is inferred from the length of chunks_list.
+    """
+    chunks_list: list[str] = []
+    if isinstance(status_doc.chunks_list, list):
+        chunks_list = [
+            chunk_id
+            for chunk_id in status_doc.chunks_list
+            if isinstance(chunk_id, str) and chunk_id
+        ]
+
+    if isinstance(status_doc.chunks_count, int) and status_doc.chunks_count >= 0:
+        return chunks_list, status_doc.chunks_count
+
+    return chunks_list, len(chunks_list)
+
+
 @final
 @dataclass
 class LightRAG:
@@ -157,8 +180,8 @@ class LightRAG:
     workspace: str = field(default_factory=lambda: os.getenv("WORKSPACE", ""))
     """Workspace for data isolation. Defaults to empty string if WORKSPACE environment variable is not set."""
 
-    # Logging (Deprecated, use setup_logger in utils.py instead)
     # ---
+    # TODO: Deprecated, use setup_logger in utils.py instead
     log_level: int | None = field(default=None)
     log_file_path: str | None = field(default=None)
 
@@ -210,6 +233,13 @@ class LightRAG:
         default=get_env_value("MAX_GLEANING", DEFAULT_MAX_GLEANING, int)
     )
     """Maximum number of entity extraction attempts for ambiguous content."""
+
+    max_extract_input_tokens: int = field(
+        default=get_env_value(
+            "MAX_EXTRACT_INPUT_TOKENS", DEFAULT_MAX_EXTRACT_INPUT_TOKENS, int
+        )
+    )
+    """Maximum tokens allowed for entity extraction input context."""
 
     force_llm_summary_on_merge: int = field(
         default=get_env_value(
@@ -518,14 +548,9 @@ class LightRAG:
                 f"max_total_tokens({self.summary_max_tokens}) should greater than summary_length_recommended({self.summary_length_recommended})"
             )
 
-        # Fix global_config now
-        global_config = asdict(self)
-
-        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in global_config.items()])
-        logger.debug(f"LightRAG init with param:\n  {_print_config}\n")
-
         # Init Embedding
-        # Step 1: Capture max_token_size before applying decorator (decorator strips dataclass attributes)
+        # Step 1: Capture embedding_func and max_token_size before applying rate_limit decorator
+        original_embedding_func = self.embedding_func
         embedding_max_token_size = None
         if self.embedding_func and hasattr(self.embedding_func, "max_token_size"):
             embedding_max_token_size = self.embedding_func.max_token_size
@@ -534,12 +559,26 @@ class LightRAG:
             )
         self.embedding_token_limit = embedding_max_token_size
 
-        # Step 2: Apply priority wrapper decorator
-        self.embedding_func = priority_limit_async_func_call(
-            self.embedding_func_max_async,
-            llm_timeout=self.default_embedding_timeout,
-            queue_name="Embedding func",
-        )(self.embedding_func)
+        # Fix global_config now
+        global_config = asdict(self)
+        # Restore original EmbeddingFunc object (asdict converts it to dict)
+        global_config["embedding_func"] = original_embedding_func
+
+        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in global_config.items()])
+        logger.debug(f"LightRAG init with param:\n  {_print_config}\n")
+
+        # Step 2: Apply priority wrapper decorator to EmbeddingFunc's inner func
+        # Create a NEW EmbeddingFunc instance with the wrapped func to avoid mutating the caller's object
+        # This ensures _generate_collection_suffix can still access attributes (model_name, embedding_dim)
+        # while preventing side effects when the same EmbeddingFunc is reused across multiple LightRAG instances
+        if self.embedding_func is not None:
+            wrapped_func = priority_limit_async_func_call(
+                self.embedding_func_max_async,
+                llm_timeout=self.default_embedding_timeout,
+                queue_name="Embedding func",
+            )(self.embedding_func.func)
+            # Use dataclasses.replace() to create a new instance, leaving the original unchanged
+            self.embedding_func = replace(self.embedding_func, func=wrapped_func)
 
         # Initialize all storages
         self.key_string_value_json_storage_cls: type[BaseKVStorage] = (
@@ -1352,17 +1391,48 @@ class LightRAG:
         # Exclude IDs of documents that are already enqueued
         unique_new_doc_ids = await self.doc_status.filter_keys(all_new_doc_ids)
 
-        # Log ignored document IDs (documents that were filtered out because they already exist)
+        # Handle duplicate documents - create trackable records with current track_id
         ignored_ids = list(all_new_doc_ids - unique_new_doc_ids)
         if ignored_ids:
+            duplicate_docs: dict[str, Any] = {}
             for doc_id in ignored_ids:
                 file_path = new_docs.get(doc_id, {}).get("file_path", "unknown_source")
-                logger.warning(
-                    f"Ignoring document ID (already exists): {doc_id} ({file_path})"
+                logger.warning(f"Duplicate document detected: {doc_id} ({file_path})")
+
+                # Get existing document info for reference
+                existing_doc = await self.doc_status.get_by_id(doc_id)
+                existing_status = (
+                    existing_doc.get("status", "unknown") if existing_doc else "unknown"
                 )
-            if len(ignored_ids) > 3:
-                logger.warning(
-                    f"Total Ignoring {len(ignored_ids)} document IDs that already exist in storage"
+                existing_track_id = (
+                    existing_doc.get("track_id", "") if existing_doc else ""
+                )
+
+                # Create a new record with unique ID for this duplicate attempt
+                dup_record_id = compute_mdhash_id(f"{doc_id}-{track_id}", prefix="dup-")
+                duplicate_docs[dup_record_id] = {
+                    "status": DocStatus.FAILED,
+                    "content_summary": f"[DUPLICATE] Original document: {doc_id}",
+                    "content_length": new_docs.get(doc_id, {}).get("content_length", 0),
+                    "chunks_count": 0,
+                    "chunks_list": [],
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "file_path": file_path,
+                    "track_id": track_id,  # Use current track_id for tracking
+                    "error_msg": f"Content already exists. Original doc_id: {doc_id}, Status: {existing_status}",
+                    "metadata": {
+                        "is_duplicate": True,
+                        "original_doc_id": doc_id,
+                        "original_track_id": existing_track_id,
+                    },
+                }
+
+            # Store duplicate records in doc_status
+            if duplicate_docs:
+                await self.doc_status.upsert(duplicate_docs)
+                logger.info(
+                    f"Created {len(duplicate_docs)} duplicate document records with track_id: {track_id}"
                 )
 
         # Filter new_docs to only include documents with unique IDs
@@ -1448,6 +1518,7 @@ class LightRAG:
                 "content_length": file_size,
                 "error_msg": original_error,
                 "chunks_count": 0,  # No chunks for failed files
+                "chunks_list": [],
                 "created_at": current_time,
                 "updated_at": current_time,
                 "file_path": file_path,
@@ -1563,11 +1634,16 @@ class LightRAG:
                     DocStatus.PROCESSING,
                     DocStatus.FAILED,
                 ]:
+                    preserved_chunks_list, preserved_chunks_count = (
+                        _chunk_fields_from_status_doc(status_doc)
+                    )
                     # Prepare document for status reset to PENDING
                     docs_to_reset[doc_id] = {
                         "status": DocStatus.PENDING,
                         "content_summary": status_doc.content_summary,
                         "content_length": status_doc.content_length,
+                        "chunks_count": preserved_chunks_count,
+                        "chunks_list": preserved_chunks_list,
                         "created_at": status_doc.created_at,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                         "file_path": getattr(status_doc, "file_path", "unknown_source"),
@@ -1748,6 +1824,13 @@ class LightRAG:
                     processing_start_time = int(time.time())
                     first_stage_tasks = []
                     entity_relation_task = None
+                    chunks: dict[str, Any] = {}
+
+                    def get_failed_chunk_snapshot() -> tuple[list[str], int]:
+                        if chunks:
+                            chunk_ids = list(chunks.keys())
+                            return chunk_ids, len(chunk_ids)
+                        return _chunk_fields_from_status_doc(status_doc)
 
                     async with semaphore:
                         nonlocal processed_count
@@ -1938,6 +2021,9 @@ class LightRAG:
 
                             # Record processing end time for failed case
                             processing_end_time = int(time.time())
+                            failed_chunks_list, failed_chunks_count = (
+                                get_failed_chunk_snapshot()
+                            )
 
                             # Update document status to failed
                             await self.doc_status.upsert(
@@ -1945,6 +2031,8 @@ class LightRAG:
                                     doc_id: {
                                         "status": DocStatus.FAILED,
                                         "error_msg": str(e),
+                                        "chunks_count": failed_chunks_count,
+                                        "chunks_list": failed_chunks_list,
                                         "content_summary": status_doc.content_summary,
                                         "content_length": status_doc.content_length,
                                         "created_at": status_doc.created_at,
@@ -2065,6 +2153,9 @@ class LightRAG:
 
                                 # Record processing end time for failed case
                                 processing_end_time = int(time.time())
+                                failed_chunks_list, failed_chunks_count = (
+                                    get_failed_chunk_snapshot()
+                                )
 
                                 # Update document status to failed
                                 await self.doc_status.upsert(
@@ -2072,6 +2163,8 @@ class LightRAG:
                                         doc_id: {
                                             "status": DocStatus.FAILED,
                                             "error_msg": str(e),
+                                            "chunks_count": failed_chunks_count,
+                                            "chunks_list": failed_chunks_list,
                                             "content_summary": status_doc.content_summary,
                                             "content_length": status_doc.content_length,
                                             "created_at": status_doc.created_at,

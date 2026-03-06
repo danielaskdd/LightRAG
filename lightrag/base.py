@@ -220,6 +220,44 @@ class BaseVectorStorage(StorageNameSpace, ABC):
     cosine_better_than_threshold: float = field(default=0.2)
     meta_fields: set[str] = field(default_factory=set)
 
+    def _validate_embedding_func(self):
+        """Validate that embedding_func is provided.
+
+        This method should be called at the beginning of __post_init__
+        in all vector storage implementations.
+
+        Raises:
+            ValueError: If embedding_func is None
+        """
+        if self.embedding_func is None:
+            raise ValueError(
+                "embedding_func is required for vector storage. "
+                "Please provide a valid EmbeddingFunc instance."
+            )
+
+    def _generate_collection_suffix(self) -> str | None:
+        """Generates collection/table suffix from embedding_func.
+
+        Return suffix if model_name exists in embedding_func, otherwise return None.
+        Note: embedding_func is guaranteed to exist (validated in __post_init__).
+
+        Returns:
+            str | None: Suffix string e.g. "text_embedding_3_large_3072d", or None if model_name not available
+        """
+        import re
+
+        # Check if model_name exists (model_name is optional in EmbeddingFunc)
+        model_name = getattr(self.embedding_func, "model_name", None)
+        if not model_name:
+            return None
+
+        # embedding_dim is required in EmbeddingFunc
+        embedding_dim = self.embedding_func.embedding_dim
+
+        # Generate suffix: clean model name and append dimension
+        safe_model_name = re.sub(r"[^a-zA-Z0-9_]", "_", model_name.lower())
+        return f"{safe_model_name}_{embedding_dim}d"
+
     @abstractmethod
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
@@ -597,10 +635,10 @@ class BaseGraphStorage(StorageNameSpace, ABC):
             edges: List of edges to be deleted, each edge is a (source, target) tuple
         """
 
-    # TODO: deprecated
     @abstractmethod
     async def get_all_labels(self) -> list[str]:
-        """Get all labels in the graph.
+        """Get all labels(entity names) in the graph.
+        Do not use this method for large graph, use get_popular_labels or search_labels instead.
 
         Returns:
             A list of all node labels in the graph, sorted alphabetically
@@ -614,7 +652,7 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         Retrieve a connected subgraph of nodes where the label includes the specified `node_label`.
 
         Args:
-            node_label: Label of the starting node，* means all nodes
+            node_label: Label(entity name) of the starting node，* means all nodes
             max_depth: Maximum depth of the subgraph, Defaults to 3
             max_nodes: Maxiumu nodes to return, Defaults to 1000（BFS if possible)
 
@@ -642,7 +680,7 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
     @abstractmethod
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
-        """Get popular labels by node degree (most connected entities)
+        """Get popular labels(entity names) by node degree (most connected entities)
 
         Args:
             limit: Maximum number of labels to return
@@ -653,7 +691,7 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
     @abstractmethod
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
-        """Search labels with fuzzy matching
+        """Search labels(entity names) with fuzzy matching
 
         Args:
             query: Search query string

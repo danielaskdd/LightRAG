@@ -36,6 +36,7 @@ class MemgraphStorage(BaseGraphStorage):
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
         # Priority: 1) MEMGRAPH_WORKSPACE env 2) user arg 3) default 'base'
         memgraph_workspace = os.environ.get("MEMGRAPH_WORKSPACE")
+        original_workspace = workspace  # Save original value for logging
         if memgraph_workspace and memgraph_workspace.strip():
             workspace = memgraph_workspace
 
@@ -48,6 +49,13 @@ class MemgraphStorage(BaseGraphStorage):
             global_config=global_config,
             embedding_func=embedding_func,
         )
+
+        # Log after super().__init__() to ensure self.workspace is initialized
+        if memgraph_workspace and memgraph_workspace.strip():
+            logger.info(
+                f"Using MEMGRAPH_WORKSPACE environment variable: '{memgraph_workspace}' (overriding '{original_workspace}/{namespace}')"
+            )
+
         self._driver = None
 
     def _get_workspace_label(self) -> str:
@@ -305,7 +313,7 @@ class MemgraphStorage(BaseGraphStorage):
 
     async def get_all_labels(self) -> list[str]:
         """
-        Get all existing node labels in the database
+        Get all existing node labels(entity names) in the database
         Returns:
             ["Person", "Company", ...]  # Alphabetically sorted label list
 
@@ -1038,10 +1046,10 @@ class MemgraphStorage(BaseGraphStorage):
         """Get popular labels by node degree (most connected entities)
 
         Args:
-            limit: Maximum number of labels to return
+            limit: Maximum number of labels(entity names) to return
 
         Returns:
-            List of labels sorted by degree (highest first)
+            List of labels(entity names) sorted by degree (highest first)
         """
         if self._driver is None:
             raise RuntimeError(
@@ -1080,14 +1088,14 @@ class MemgraphStorage(BaseGraphStorage):
             return []
 
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
-        """Search labels with fuzzy matching
+        """Search labels(entity names) with fuzzy matching
 
         Args:
             query: Search query string
             limit: Maximum number of results to return
 
         Returns:
-            List of matching labels sorted by relevance
+            List of matching labels(entity names) sorted by relevance
         """
         if self._driver is None:
             raise RuntimeError(
