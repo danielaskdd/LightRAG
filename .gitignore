@@ -9,10 +9,14 @@ __pycache__/
 
 # Virtual Environment
 .venv/
-env/
 venv/
-*.env*
-.env_example
+
+# Enviroment Variable Files
+.env
+.env.backup.*
+
+# Generated Docker Compose files (output of setup wizard)
+docker-compose.*.yml
 
 # Build / Distribution
 dist/
@@ -46,9 +50,12 @@ neo4jWorkDir/
 
 # Data & Storage
 inputs/
+output/
 rag_storage/
-examples/input/
-examples/output/
+data/
+
+# Evaluation results
+lightrag/evaluation/results/
 
 # Miscellaneous
 .DS_Store
@@ -57,13 +64,23 @@ ignore_this.txt
 *.ignore.*
 
 # Project-specific files
-dickens*/
-book.txt
-lightrag-dev/
-gui/
+/dickens*/
+/book.txt
+download_models_hf.py
 
-# unit-test files
-test_*
+# Frontend build output (built during PyPI release)
+/lightrag/api/webui/
+
+# temporary test files in project root
+/test_*
 
 # Cline files
-memory-bank/
+memory-bank
+.claude/CLAUDE.md
+.claude/
+
+# Claude Code
+CLAUDE.md
+
+# Google Jules
+.jules/
