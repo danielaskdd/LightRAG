@@ -13,39 +13,44 @@ through, so attribution is exact and does not depend on knowing the hot paths in
 advance.
 
 --------------------------------------------------------------------------------
-ENABLE (must run inside each worker that holds the proxies — i.e. workers>1):
+ENABLE (must be installed in the process that HOLDS the proxies — i.e. workers>1).
+lightrag-gunicorn already sets preload_app=True and creates the Manager in the
+master before forking, so patching the master's BaseProxy class makes every
+worker inherit it via fork.
 
-Option 1 — gunicorn --preload (cleanest; workers inherit the patched class):
-    Ensure this module is imported in the master BEFORE the fork and the env var
-    is set. In a gunicorn config file:
-        # gunicorn_profile.conf.py
-        preload_app = True
-        import os, sys
-        sys.path.insert(0, "scripts/benchmarks")
-        os.environ["LIGHTRAG_RPC_PROFILE"] = "1"
-        os.environ["LIGHTRAG_RPC_PROFILE_DIR"] = "/tmp/rpcprof"
-        import rpc_profiler  # auto-installs on import
-    Each worker inherits the patched _callmethod and keeps its OWN counters
-    (copied at fork); each dumps its own file on exit / signal.
-
-Option 2 — any launcher, via usercustomize (no code edit, no preload needed):
-    mkdir -p /tmp/prof && cp scripts/benchmarks/rpc_profiler.py /tmp/prof/
-    printf 'import rpc_profiler\n' > /tmp/prof/usercustomize.py
+Option 1 — sitecustomize hook (RECOMMENDED; zero code edit, works with
+lightrag-gunicorn). sitecustomize runs at interpreter startup, before the master
+creates the Manager:
+    mkdir -p /tmp/rpcprof_hook
+    cp scripts/benchmarks/rpc_profiler.py /tmp/rpcprof_hook/
+    printf 'import rpc_profiler\n' > /tmp/rpcprof_hook/sitecustomize.py
+    rm -rf /tmp/rpcprof && mkdir -p /tmp/rpcprof
     LIGHTRAG_RPC_PROFILE=1 LIGHTRAG_RPC_PROFILE_DIR=/tmp/rpcprof \
-        PYTHONPATH=/tmp/prof:$PYTHONPATH  <your normal server/ingest command>
-    usercustomize runs at interpreter startup in every process that starts a
-    fresh interpreter. (Forked-only workers inherit the patch from the parent;
-    re-exec'd workers install it themselves.)
+        LIGHTRAG_RPC_PROFILE_EVERY=200000 PYTHONPATH=/tmp/rpcprof_hook \
+        lightrag-gunicorn --workers 4
+    (Use sitecustomize, NOT usercustomize: virtualenvs commonly disable user-site
+    so usercustomize never fires. If the env already ships a sitecustomize, this
+    one shadows it for the run — fine for a temporary profile.)
+
+Option 2 — explicit env-gated import in lightrag/api/gunicorn_config.py (add near
+the top; runs in the master before initialize_share_data):
+    if os.environ.get("LIGHTRAG_RPC_PROFILE"):
+        import rpc_profiler  # noqa: F401  (needs scripts/benchmarks on PYTHONPATH)
+    then launch with the same LIGHTRAG_RPC_PROFILE* env + PYTHONPATH as Option 1.
 
 Option 3 — in-process reproduction (a driver script using initialize_share_data(N)):
     import rpc_profiler; rpc_profiler.install()  # then run the workload
 
 --------------------------------------------------------------------------------
-DUMP: each process writes ``<DIR>/rpc_profile_<pid>.jsonl`` on
-  - normal exit (atexit),
-  - SIGTERM / SIGINT (graceful server shutdown),
-  - SIGUSR1 on demand (``kill -USR1 <pid>``) WITHOUT exiting — good for dumping a
-    long-lived server right after a processing batch finishes.
+DUMP: each process (re)writes ``<DIR>/rpc_profile_<pid>.jsonl`` atomically on
+  - normal exit (atexit — runs on gunicorn's graceful worker shutdown), and
+  - every LIGHTRAG_RPC_PROFILE_EVERY records (default 1,000,000) while running.
+
+  Signals are deliberately NOT used: gunicorn workers reinstall their own signal
+  handlers after fork, which would clobber ours. The periodic flush makes the
+  latest counts available on disk without stopping the server — after an ingest
+  batch, either read the already-flushed file or stop the server (atexit writes
+  the final tail). Set EVERY smaller (e.g. 100000) to flush more often.
 
 REPORT (merge all per-pid files into one ranked table):
     python scripts/benchmarks/rpc_profiler.py report /tmp/rpcprof
@@ -62,7 +67,6 @@ import atexit
 import itertools
 import json
 import os
-import signal
 import sys
 import threading
 from collections import Counter
@@ -70,8 +74,10 @@ from collections import Counter
 _method_counts: Counter = Counter()  # methodname -> exact total across all calls
 _site_counts: Counter = Counter()  # (methodname, "file:line") -> sampled count
 _lock = threading.Lock()
+_dump_lock = threading.Lock()
 _counter = itertools.count()
 _SAMPLE = max(1, int(os.environ.get("LIGHTRAG_RPC_PROFILE_SAMPLE", "1")))
+_EVERY = max(0, int(os.environ.get("LIGHTRAG_RPC_PROFILE_EVERY", "1000000")))
 _installed = False
 
 
@@ -115,6 +121,8 @@ def _record(methodname: str) -> None:
         _method_counts[methodname] += 1
         if sampled:
             _site_counts[(methodname, site)] += 1
+    if _EVERY and n and n % _EVERY == 0:
+        dump()
 
 
 def install() -> None:
@@ -143,58 +151,37 @@ def install() -> None:
     BaseProxy._incref = incref
 
     atexit.register(dump)
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        _chain_signal(sig, dump_and_reraise=True)
-    _chain_signal(signal.SIGUSR1, dump_and_reraise=False)
-
-
-def _chain_signal(sig, dump_and_reraise: bool) -> None:
-    prev = signal.getsignal(sig)
-
-    def handler(signum, frame):
-        try:
-            dump()
-        finally:
-            if dump_and_reraise:
-                signal.signal(sig, prev if callable(prev) else signal.SIG_DFL)
-                os.kill(os.getpid(), sig)
-
-    try:
-        signal.signal(sig, handler)
-    except (ValueError, OSError):
-        pass  # not on the main thread; atexit still covers normal exit
 
 
 def dump() -> None:
+    """Atomically (re)write this process's per-pid dump. Safe to call repeatedly
+    (periodic flush) and from any thread; the last writer wins."""
     out_dir = os.environ.get("LIGHTRAG_RPC_PROFILE_DIR", ".")
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"rpc_profile_{os.getpid()}.jsonl")
     with _lock:
         methods = dict(_method_counts)
         sites = {f"{m}\t{s}": c for (m, s), c in _site_counts.items()}
-    with open(path, "w") as f:
-        f.write(
-            json.dumps(
-                {
-                    "pid": os.getpid(),
-                    "sample": _SAMPLE,
-                    "type": "methods",
-                    "counts": methods,
-                }
-            )
-            + "\n"
+    payload = (
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "sample": _SAMPLE,
+                "type": "methods",
+                "counts": methods,
+            }
         )
-        f.write(
-            json.dumps(
-                {
-                    "pid": os.getpid(),
-                    "sample": _SAMPLE,
-                    "type": "sites",
-                    "counts": sites,
-                }
-            )
-            + "\n"
+        + "\n"
+        + json.dumps(
+            {"pid": os.getpid(), "sample": _SAMPLE, "type": "sites", "counts": sites}
         )
+        + "\n"
+    )
+    with _dump_lock:  # serialize concurrent flushes; write-then-rename for atomicity
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            f.write(payload)
+        os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------
