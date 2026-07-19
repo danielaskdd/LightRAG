@@ -7,8 +7,28 @@ driving issue/PR.
 
 | Script | Plan stage | Decides |
 |---|---|---|
+| `rpc_profiler.py` | attribution | WHERE the remaining Manager RPCs concentrate in a real run — run this FIRST to pick the next target with data |
 | `bench_manager_rpc.py` | 3a + 3b layer 1 | queue-stats aggregation structure; pure per-op IPC cost of the four log-write forms |
 | `bench_log_replay.py` | 3b layer 2 | end-to-end effect of the log-write forms on a **captured** pipeline trace — the actual PR-C / reopen-#3432 gate |
+
+## Picking the next target: profile first
+
+After #3433/#3434 landed a real ~10% end-to-end win (60s → 54s ingest) purely by
+cutting RPC counts, the next target should be chosen from a real-run attribution,
+not guessed. `rpc_profiler.py` monkeypatches `BaseProxy._callmethod`/`_incref` in
+each worker and dumps a per-pid count of Manager round trips by method and by
+nearest `lightrag/` call site. Enable it (see the module docstring — gunicorn
+`--preload`, `usercustomize`, or an in-process driver), reproduce the ingest,
+signal `kill -USR1 <pid>` after the batch (or let it dump at exit), then:
+
+```bash
+python scripts/benchmarks/rpc_profiler.py report /tmp/rpcprof
+```
+
+A synthetic mini-run already shows the keyed-lock machinery (acquire/release plus
+its registry `get`/`__setitem__`/`pop`, ~18–20 round trips per lock cycle) as the
+dominant category — the real profile confirms whether that, or the hot-path log
+writes, is the bigger lever before committing to either.
 
 ## Preset thresholds (fixed before running)
 
